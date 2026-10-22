@@ -460,6 +460,7 @@ def test_daemon_sets_its_rank_like_engine_workers(monkeypatch):
     compiled artifact and run every rank's kernels on rank 0's device."""
     from types import SimpleNamespace
 
+    from vllm.config import CacheConfig
     from vllm.model_executor.model_loader.weight_cache import daemon
 
     monkeypatch.setattr(
@@ -476,6 +477,7 @@ def test_daemon_sets_its_rank_like_engine_workers(monkeypatch):
                 rank=0,
             ),
             model_config=SimpleNamespace(is_moe=False),
+            cache_config=CacheConfig(),
         )
         server = daemon.WeightCacheDaemon(
             vllm_config, global_rank, global_rank, "tcp://127.0.0.1:0"
