@@ -1683,28 +1683,45 @@ def test_modelopt_block_quant_loads_expert_blocks_with_aligned_tp_slices(
 
 @pytest.mark.skipif(
     not current_platform.is_cuda() or not current_platform.has_device_capability(89),
-    reason="Requires CUDA CUTLASS FP8 kernels",
+    reason="Requires CUDA FP8 kernels",
+)
+@pytest.mark.parametrize(
+    "backend,dtype_name,bias",
+    [
+        ("cutlass", "bfloat16", False),
+        ("marlin", "float16", True),
+        ("marlin", "bfloat16", True),
+    ],
 )
 @pytest.mark.parametrize("algorithm", ["FP8", "FP8_PER_CHANNEL_PER_TOKEN"])
 @pytest.mark.parametrize("output_sizes", [[32, 32], [17, 32]])
 @torch.inference_mode()
 def test_modelopt_fp8_preprocessed_shared_weights(
-    algorithm, output_sizes, dist_init, workspace_init, monkeypatch
+    backend,
+    dtype_name,
+    bias,
+    algorithm,
+    output_sizes,
+    dist_init,
+    workspace_init,
+    monkeypatch,
 ):
     """Repeated attachments retain fused/padded weights and exact outputs."""
     from vllm.config import KernelConfig
     from vllm.model_executor.kernels.linear.scaled_mm import (
         CutlassFP8ScaledMMLinearKernel,
+        MarlinFP8ScaledMMLinearKernel,
     )
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
     from vllm.model_executor.model_loader.utils import process_weights_after_loading
     from vllm.model_executor.utils import replace_parameter, weights_already_processed
     from vllm.utils.torch_utils import set_default_torch_dtype
 
-    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0" if backend == "marlin" else "1")
+    dtype = getattr(torch, dtype_name)
     config = VllmConfig(
-        model_config=ModelConfig(model="facebook/opt-125m", dtype="bfloat16"),
-        kernel_config=KernelConfig(linear_backend="cutlass"),
+        model_config=ModelConfig(model="facebook/opt-125m", dtype=dtype_name),
+        kernel_config=KernelConfig(linear_backend=backend),
     )
     quant_config = ModelOptFp8Config(
         quant_method=algorithm,
@@ -1714,19 +1731,26 @@ def test_modelopt_fp8_preprocessed_shared_weights(
     )
     with (
         set_current_vllm_config(config),
-        set_default_torch_dtype(torch.bfloat16),
+        set_default_torch_dtype(dtype),
         torch.device("cuda"),
     ):
         source = MergedColumnParallelLinear(
             64,
             output_sizes,
-            bias=False,
-            params_dtype=torch.bfloat16,
+            bias=bias,
+            params_dtype=dtype,
             quant_config=quant_config,
         )
         assert isinstance(source.quant_method, ModelOptLinearMethod)
-        assert isinstance(source.quant_method.kernel, CutlassFP8ScaledMMLinearKernel)
+        kernel_type = (
+            MarlinFP8ScaledMMLinearKernel
+            if backend == "marlin"
+            else CutlassFP8ScaledMMLinearKernel
+        )
+        assert isinstance(source.quant_method.kernel, kernel_type)
         torch.manual_seed(0)
+        if bias:
+            source.bias.copy_(torch.randn_like(source.bias))
         source.weight.copy_(torch.randn(source.weight.shape).to(source.weight.dtype))
         source.weight_scale.copy_(
             torch.linspace(0.01, 0.03, source.weight_scale.numel()).reshape(
@@ -1736,7 +1760,7 @@ def test_modelopt_fp8_preprocessed_shared_weights(
         if algorithm == "FP8":
             source.input_scale.copy_(torch.tensor([0.01, 0.02]))
         process_weights_after_loading(source, config.model_config, torch.device("cuda"))
-        inputs = torch.randn(3, 64, dtype=torch.bfloat16)
+        inputs = torch.randn(3, 64, dtype=dtype)
         expected, _ = source(inputs)
         shared = dict(source.named_parameters())
         snapshots = {name: param.detach().clone() for name, param in shared.items()}
@@ -1745,8 +1769,8 @@ def test_modelopt_fp8_preprocessed_shared_weights(
                 attached = MergedColumnParallelLinear(
                     64,
                     output_sizes,
-                    bias=False,
-                    params_dtype=torch.bfloat16,
+                    bias=bias,
+                    params_dtype=dtype,
                     quant_config=quant_config,
                 )
             for name, param in shared.items():
@@ -1770,8 +1794,11 @@ def test_modelopt_fp8_preprocessed_shared_weights(
     not current_platform.is_cuda() or not current_platform.has_device_capability(89),
     reason="Requires CUDA FP8 kernels",
 )
-@pytest.mark.parametrize("backend", ["torch", "triton"])
-def test_modelopt_fp8_preprocessed_unsupported_backend(backend, dist_init):
+@pytest.mark.parametrize(
+    "backend,algorithm",
+    [("torch", "FP8"), ("triton", "FP8"), ("marlin", "FP8_PB_WO")],
+)
+def test_modelopt_fp8_preprocessed_unsupported_backend(backend, algorithm, dist_init):
     """An unvalidated backend must reject IPC weights before using them."""
     from vllm.config import KernelConfig
     from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -1782,15 +1809,22 @@ def test_modelopt_fp8_preprocessed_unsupported_backend(backend, dist_init):
         model_config=ModelConfig(model="facebook/opt-125m", dtype="bfloat16"),
         kernel_config=KernelConfig(linear_backend=backend),
     )
-    quant_config = ModelOptFp8Config("FP8", True, None, [])
+    quant_config = ModelOptFp8Config(algorithm, True, None, [])
     with set_current_vllm_config(config), torch.device("meta"):
         layer = ReplicatedLinear(
-            64,
-            64,
+            256,
+            256,
             bias=False,
             params_dtype=torch.bfloat16,
             quant_config=quant_config,
         )
+    if backend == "marlin":
+        from vllm.model_executor.kernels.linear.scaled_mm import (
+            MarlinFP8ScaledMMLinearKernel,
+        )
+
+        assert isinstance(layer.quant_method, ModelOptLinearMethod)
+        assert isinstance(layer.quant_method.kernel, MarlinFP8ScaledMMLinearKernel)
     with (
         weights_already_processed(),
         pytest.raises(

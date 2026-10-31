@@ -229,6 +229,34 @@ The daemon's `--weight-cache-socket-dir` and the loader's `socket_dir` /
 Socket paths are derived from the GPU UUID, so they are stable regardless of
 `CUDA_VISIBLE_DEVICES` index remapping.
 
+## ModelOpt FP8 with Marlin
+
+The weight cache supports serialized ModelOpt `FP8` (per-tensor) and
+`FP8_PER_CHANNEL_PER_TOKEN` dense linear layers with the Marlin backend on
+CUDA GPUs supported by ModelOpt FP8 and Marlin. Use FP16 or BF16 activations
+and select the same dtype and backend for the daemon and every engine.
+Marlin uses the FP8 weights with FP16/BF16 activations; it does not reproduce
+CUTLASS's FP8 activation quantization. Backend selection remains automatic
+unless you explicitly set `linear_backend`.
+
+For example, start a daemon, then run an engine in a second terminal:
+
+```bash
+vllm preload --model CedricHwang/qwen2.5-0.5b-modelopt-fp8-pc-pt \
+    --dtype bfloat16 --kernel-config '{"linear_backend": "marlin"}'
+```
+
+```bash
+vllm serve CedricHwang/qwen2.5-0.5b-modelopt-fp8-pc-pt \
+    --dtype bfloat16 --kernel-config '{"linear_backend": "marlin"}' \
+    --load-format ipc_cache --model-loader-extra-config '{"fallback": false}'
+```
+
+The daemon packs weights and prepares scales and bias once. Repeated engine
+restarts reuse those tensors without repacking or modifying shared memory.
+This support excludes ModelOpt block FP8, FP8 MoE, other FP8 backends, and
+Marlin batch-invariant execution (`VLLM_BATCH_INVARIANT=1`).
+
 ## Limitations
 
 - **Platform**: CUDA and ROCm only; other platforms raise
@@ -261,11 +289,12 @@ Socket paths are derived from the GPU UUID, so they are stable regardless of
   quantization again. This does not enable online MoE quantization or
   conversion from an already quantized checkpoint.
   Serialized ModelOpt `FP8` (per-tensor) and `FP8_PER_CHANNEL_PER_TOKEN`
-  linear layers also support CUDA IPC with the CUTLASS linear backend.
-  Set the same `--kernel-config '{"linear_backend": "cutlass"}'` on the daemon
-  and engine. Engines reuse the processed weights and scales, including
+  linear layers also support CUDA IPC with the CUTLASS linear backend, or
+  [Marlin](#modelopt-fp8-with-marlin).
+  For CUTLASS, set `--kernel-config '{"linear_backend": "cutlass"}'` on both
+  the daemon and engine. Engines reuse the processed weights and scales, including
   fused-projection scales and output padding. This does not enable ModelOpt
-  block FP8, FP8 MoE, or other FP8 linear backends.
+  block FP8, FP8 MoE, or FP8 linear backends other than CUTLASS and Marlin.
   ModelOpt NVFP4 MoE supports the TRT-LLM and vLLM CUTLASS backends. With
   CUTLASS, the daemon fuses activation scales once; engines reuse the fused
   scales without modifying the daemon's shared tensors.

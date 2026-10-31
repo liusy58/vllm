@@ -26,6 +26,12 @@ following `quantization.quant_algo` values:
 For per-tensor `FP8`, vLLM converts E4M3FN weights and scales to E4M3FNUZ
 when required by the GPU, for example on AMD MI300.
 
+Serialized `FP8` and `FP8_PER_CHANNEL_PER_TOKEN` dense layers can reuse
+preloaded weights across engine restarts with CUTLASS or Marlin. Marlin uses
+FP16/BF16 activations rather than FP8 activation quantization. See
+[ModelOpt FP8 with Marlin and the weight cache](../preload.md#modelopt-fp8-with-marlin)
+for matching daemon/engine commands and compatibility limits.
+
 For Qwen3-based DFlash and DSpark drafts, `quantized_layers` and exclusion lists
 use the exported checkpoint's module names. vLLM maps these names to the draft's
 module prefix and decoder layer indices before constructing quantized layers.

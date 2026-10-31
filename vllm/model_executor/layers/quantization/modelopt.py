@@ -20,6 +20,7 @@ from vllm.model_executor.kernels.linear import (
 )
 from vllm.model_executor.kernels.linear.scaled_mm import (
     CutlassFP8ScaledMMLinearKernel,
+    MarlinFP8ScaledMMLinearKernel,
 )
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.fused_moe import (
@@ -2674,7 +2675,10 @@ class ModelOptLinearMethod(LinearMethodBase):
             w.dtype == FP4_DTYPE
             or (
                 w in (kFp8StaticTensorSym, kFp8StaticTokenSym)
-                and isinstance(self.kernel, CutlassFP8ScaledMMLinearKernel)
+                and isinstance(
+                    self.kernel,
+                    (CutlassFP8ScaledMMLinearKernel, MarlinFP8ScaledMMLinearKernel),
+                )
                 and type(self.fmt) is FormatScheme
             )
             or (

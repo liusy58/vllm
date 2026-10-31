@@ -154,6 +154,7 @@ def generate(
     case: ModelCase,
     socket_dir: str | None,
     fallback: bool,
+    num_logprobs: int | None = None,
 ):
     extra_config = (
         {} if socket_dir is None else {"socket_dir": socket_dir, "fallback": fallback}
@@ -167,7 +168,15 @@ def generate(
         max_num_seqs=1,
         **case.llm_kwargs,
     ) as llm:
-        sampling_params = SamplingParams(temperature=0, max_tokens=16, ignore_eos=True)
+        sampling_params = SamplingParams(
+            temperature=0,
+            max_tokens=16,
+            ignore_eos=True,
+            logprobs=num_logprobs,
+            prompt_logprobs=num_logprobs,
+        )
+        if num_logprobs is not None:
+            return llm.generate_w_logprobs(case.prompts, sampling_params)
         return llm.generate(case.prompts, sampling_params, images=case.images)
 
 
@@ -380,10 +389,22 @@ MODELOPT_FP8_CASE = ModelCase(
 )
 
 
-def test_ipc_cache_modelopt_fp8(vllm_runner, tmp_path, monkeypatch):
+@pytest.mark.parametrize("backend", ["cutlass", "marlin"])
+def test_ipc_cache_modelopt_fp8(backend, vllm_runner, tmp_path, monkeypatch):
     """Serialized ModelOpt FP8 tensors survive repeated IPC attachment."""
-    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
-    run_cold_start_and_warm_restart(vllm_runner, MODELOPT_FP8_CASE, tmp_path)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0" if backend == "marlin" else "1")
+    kernel_config = {"linear_backend": backend}
+    daemon_args = list(MODELOPT_FP8_CASE.daemon_args)
+    daemon_args[daemon_args.index("--kernel-config") + 1] = json.dumps(kernel_config)
+    case = ModelCase(
+        model=MODELOPT_FP8_CASE.model,
+        prompts=MODELOPT_FP8_CASE.prompts,
+        llm_kwargs={**MODELOPT_FP8_CASE.llm_kwargs, "kernel_config": kernel_config},
+        daemon_args=daemon_args,
+    )
+    run_cold_start_and_warm_restart(
+        vllm_runner, case, tmp_path, num_logprobs=5 if backend == "marlin" else None
+    )
 
 
 NVFP4_CASE = ModelCase(
@@ -502,19 +523,31 @@ def test_d2d_warmup_cache_seeding(vllm_runner, tmp_path):
     assert mirror_outputs == baseline_outputs
 
 
-def run_cold_start_and_warm_restart(vllm_runner, case: ModelCase, tmp_path, capfd=None):
+def run_cold_start_and_warm_restart(
+    vllm_runner, case: ModelCase, tmp_path, capfd=None, *, num_logprobs=None
+):
     # Baseline: plain disk loading with the default loader.
     baseline_outputs = generate(
         vllm_runner,
         case,
         None,
         fallback=True,
+        num_logprobs=num_logprobs,
     )
-    assert all(text for _, texts in baseline_outputs for text in texts)
+    if num_logprobs is None:
+        assert all(text for _, texts in baseline_outputs for text in texts)
+    else:
+        assert all(len(output[0]) == 16 for output in baseline_outputs)
 
     # Cold start: no daemon is serving, so the loader falls back to disk.
     with tempfile.TemporaryDirectory(prefix="vllm_ipc_empty_") as empty_socket_dir:
-        cold_outputs = generate(vllm_runner, case, empty_socket_dir, fallback=True)
+        cold_outputs = generate(
+            vllm_runner,
+            case,
+            empty_socket_dir,
+            fallback=True,
+            num_logprobs=num_logprobs,
+        )
 
     if case.check_flashinfer_cache:
         # The baseline engine already wrote its own (LLM_CLASS-keyed) table.
@@ -526,7 +559,9 @@ def run_cold_start_and_warm_restart(vllm_runner, case: ModelCase, tmp_path, capf
         extra_args=case.daemon_args,
     ) as d:
         d.wait_until_ready()
-        warm_outputs = generate(vllm_runner, case, d.socket_dir, fallback=False)
+        warm_outputs = generate(
+            vllm_runner, case, d.socket_dir, fallback=False, num_logprobs=num_logprobs
+        )
         if case.check_flashinfer_cache:
             # Each daemon tunes before its ready report; exactly one new file
             # (their OPENAI_API_SERVER-keyed table) must appear.
@@ -538,7 +573,9 @@ def run_cold_start_and_warm_restart(vllm_runner, case: ModelCase, tmp_path, capf
         # Warm restart: a second engine lifetime against the same daemon.
         if case.check_flashinfer_cache:
             capfd.readouterr()  # drain: the assertion reads the increment
-        restart_outputs = generate(vllm_runner, case, d.socket_dir, fallback=False)
+        restart_outputs = generate(
+            vllm_runner, case, d.socket_dir, fallback=False, num_logprobs=num_logprobs
+        )
         if case.check_flashinfer_cache:
             # The restart's EngineCore subprocess inherits pytest's fds; the
             # flashinfer autotuner logs "[Autotuner]: Loaded N configs from
@@ -551,9 +588,25 @@ def run_cold_start_and_warm_restart(vllm_runner, case: ModelCase, tmp_path, capf
                 "restart engine did not load the on-disk autotune cache"
             )
 
-    assert cold_outputs == baseline_outputs
-    assert warm_outputs == baseline_outputs
-    assert restart_outputs == baseline_outputs
+    if num_logprobs is None:
+        assert cold_outputs == baseline_outputs
+        assert warm_outputs == baseline_outputs
+        assert restart_outputs == baseline_outputs
+    else:
+        from tests.models.utils import check_logprobs_close
+
+        for name, outputs in (
+            ("disk fallback", cold_outputs),
+            ("IPC attach", warm_outputs),
+            ("IPC restart", restart_outputs),
+        ):
+            assert all(len(output[0]) == 16 for output in outputs)
+            check_logprobs_close(
+                outputs_0_lst=baseline_outputs,
+                outputs_1_lst=outputs,
+                name_0="ordinary loading",
+                name_1=name,
+            )
 
 
 def _parallel(**kw):
