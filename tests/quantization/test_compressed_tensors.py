@@ -5,6 +5,7 @@
 Run `pytest tests/quantization/test_compressed_tensors.py`.
 """
 
+from itertools import product
 from unittest.mock import Mock
 
 import pytest
@@ -1168,15 +1169,24 @@ def test_mxfp4_moe_with_mxfp4_inputs_keeps_w4a4_method(monkeypatch):
     not current_platform.is_cuda() or not current_platform.has_device_capability(89),
     reason="Requires CUDA FP8 kernels",
 )
-@pytest.mark.parametrize("strategy", ["tensor", "channel"])
-@pytest.mark.parametrize("static_input", [False, True])
-@pytest.mark.parametrize("output_sizes", [[32, 32], [17, 32]])
 @pytest.mark.parametrize(
-    "backend,dtype_name,bias",
+    "strategy,static_input,output_sizes,backend,dtype_name,bias",
     [
-        ("cutlass", "bfloat16", False),
-        ("marlin", "float16", True),
-        ("marlin", "bfloat16", True),
+        (*case, *backend)
+        for case, backend in product(
+            product(["tensor", "channel"], [False, True], [[32, 32], [17, 32]]),
+            [
+                ("cutlass", "bfloat16", False),
+                ("marlin", "float16", True),
+                ("marlin", "bfloat16", True),
+            ],
+        )
+    ]
+    + [
+        ("block", False, output_sizes, "marlin", dtype, True)
+        for output_sizes, dtype in product(
+            [[128, 256], [128, 257]], ["float16", "bfloat16"]
+        )
     ],
 )
 @torch.inference_mode()
@@ -1204,6 +1214,8 @@ def test_compressed_fp8_preprocessed_shared_weights(
         model_config=ModelConfig(model="facebook/opt-125m", dtype=dtype_name),
         kernel_config=KernelConfig(linear_backend=backend),
     )
+    block = strategy == "block"
+    input_size = 256 if block else 64
     quant_config = CompressedTensorsConfig.from_config(
         {
             "format": "float-quantized",
@@ -1214,13 +1226,17 @@ def test_compressed_fp8_preprocessed_shared_weights(
                         "num_bits": 8,
                         "type": "float",
                         "strategy": strategy,
+                        "block_structure": [128, 128] if block else None,
                         "symmetric": True,
                         "dynamic": False,
                     },
                     "input_activations": {
                         "num_bits": 8,
                         "type": "float",
-                        "strategy": "tensor" if static_input else "token",
+                        "strategy": "group"
+                        if block
+                        else ("tensor" if static_input else "token"),
+                        "group_size": 128 if block else None,
                         "symmetric": True,
                         "dynamic": not static_input,
                     },
@@ -1235,7 +1251,7 @@ def test_compressed_fp8_preprocessed_shared_weights(
         torch.device("cuda"),
     ):
         source = MergedColumnParallelLinear(
-            64,
+            input_size,
             output_sizes,
             bias=bias,
             params_dtype=dtype,
@@ -1244,6 +1260,7 @@ def test_compressed_fp8_preprocessed_shared_weights(
         torch.manual_seed(0)
         if backend == "marlin":
             assert isinstance(source.scheme.fp8_linear, MarlinFP8ScaledMMLinearKernel)
+            assert source.scheme.fp8_linear.block_quant == block
         source.weight.copy_(torch.randn(source.weight.shape).to(source.weight.dtype))
         if bias:
             source.bias.copy_(torch.randn_like(source.bias))
@@ -1257,14 +1274,14 @@ def test_compressed_fp8_preprocessed_shared_weights(
         process_weights_after_loading(source, config.model_config, torch.device("cuda"))
         if backend == "marlin":
             assert source.weight.dtype == torch.int32
-        x = torch.randn(3, 64, dtype=dtype)
+        x = torch.randn(3, input_size, dtype=dtype)
         expected, _ = source(x)
         shared = dict(source.named_parameters())
         snapshots = {name: param.detach().clone() for name, param in shared.items()}
         for _ in range(2):
             with torch.device("meta"):
                 attached = MergedColumnParallelLinear(
-                    64,
+                    input_size,
                     output_sizes,
                     bias=bias,
                     params_dtype=dtype,
@@ -1290,8 +1307,11 @@ def test_compressed_fp8_preprocessed_shared_weights(
     not current_platform.is_cuda() or not current_platform.has_device_capability(89),
     reason="Requires CUDA FP8 kernels",
 )
-def test_compressed_fp8_preprocessed_marlin_rejects_block(dist_init, monkeypatch):
-    """Tensor/channel support must not admit Marlin's block-scale layout."""
+@pytest.mark.parametrize("block_size", [[64, 128], [128, 64]])
+def test_compressed_fp8_preprocessed_marlin_rejects_block(
+    block_size, dist_init, monkeypatch
+):
+    """Unvalidated block shapes must remain outside the IPC capability gate."""
     from vllm.config import ModelConfig
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
     from vllm.model_executor.model_loader.utils import process_weights_after_loading
@@ -1310,7 +1330,7 @@ def test_compressed_fp8_preprocessed_marlin_rejects_block(dist_init, monkeypatch
                     num_bits=8,
                     type="float",
                     strategy="block",
-                    block_structure=[128, 128],
+                    block_structure=block_size,
                     symmetric=True,
                     dynamic=False,
                 ),

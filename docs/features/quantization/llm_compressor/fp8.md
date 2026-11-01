@@ -34,6 +34,15 @@ The FP8 types typically supported in hardware have two distinct representations,
     [`KernelConfig`](../../../cli/serve.md#kernelconfig) in the CLI
     reference and shown by `vllm serve --help=KernelConfig`.
 
+## Reusing weights across engine restarts
+
+For serialized compressed-tensors W8A8 FP8 dense models, the weight cache
+daemon can share Marlin's processed weights across engine restarts on CUDA
+GPUs with compute capability 8.9 or newer. This includes tensor/channel
+scales and 128×128 block scales. See
+[Compressed-tensors FP8 with Marlin](../../preload.md#compressed-tensors-fp8-with-marlin)
+for matching preload/serve commands, activation schemes, and limitations.
+
 ## Installation
 
 To produce performant FP8 quantized models with vLLM, you'll need to install the [llm-compressor](https://github.com/vllm-project/llm-compressor/) library:

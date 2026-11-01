@@ -414,12 +414,32 @@ COMPRESSED_FP8_MARLIN_CASE = replace(
 )
 
 
-def test_ipc_cache_compressed_fp8_marlin(vllm_runner, tmp_path, monkeypatch):
+COMPRESSED_BLOCK_FP8_MARLIN_CASE = replace(
+    COMPRESSED_FP8_MARLIN_CASE,
+    model="RedHatAI/Qwen3-0.6B-FP8-BLOCK",
+    llm_kwargs={
+        **COMPRESSED_FP8_MARLIN_CASE.llm_kwargs,
+        "revision": "5def00c475640c0527e3a7067b1a26b94decefb5",
+    },
+    daemon_args=[
+        "--revision",
+        "5def00c475640c0527e3a7067b1a26b94decefb5",
+        *COMPRESSED_FP8_MARLIN_CASE.daemon_args[2:],
+    ],
+)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(COMPRESSED_FP8_MARLIN_CASE, id="tensor-channel"),
+        pytest.param(COMPRESSED_BLOCK_FP8_MARLIN_CASE, id="block"),
+    ],
+)
+def test_ipc_cache_compressed_fp8_marlin(case, vllm_runner, tmp_path, monkeypatch):
     """Reuse Marlin's packed FP8 weights and scales across engine lifetimes."""
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
-    run_cold_start_and_warm_restart(
-        vllm_runner, COMPRESSED_FP8_MARLIN_CASE, tmp_path, num_logprobs=5
-    )
+    run_cold_start_and_warm_restart(vllm_runner, case, tmp_path, num_logprobs=5)
 
 
 NVFP4_CASE = ModelCase(

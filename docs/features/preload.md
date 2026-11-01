@@ -235,11 +235,14 @@ On CUDA GPUs with compute capability 8.9 or newer, serialized
 `compressed-tensors` W8A8 FP8 checkpoints can reuse their Marlin weights
 through the weight cache daemon. This supports dense linear layers with
 per-tensor or per-channel weight scales and static per-tensor or dynamic
-per-token checkpoint activation schemes. Marlin computes with FP8 weights
+per-token checkpoint activation schemes. It also supports 128×128 block
+weight scales with dynamic group-128 checkpoint activation quantization.
+Marlin computes with FP8 weights
 and FP16 or BF16 activations; the checkpoint's activation quantization is
 not used by this weight-only backend.
 
-Select Marlin explicitly and use the same dtype in both processes:
+Kernel selection is automatic by default. Select Marlin explicitly and use
+the same dtype in both processes:
 
 ```bash
 vllm preload --model RedHatAI/Meta-Llama-3.1-8B-FP8 \
@@ -250,12 +253,24 @@ vllm serve RedHatAI/Meta-Llama-3.1-8B-FP8 \
     --load-format ipc_cache
 ```
 
+For a block FP8 checkpoint, use the same configuration with its model name:
+
+```bash
+vllm preload --model RedHatAI/Qwen3-0.6B-FP8-BLOCK \
+    --dtype bfloat16 --kernel-config '{"linear_backend": "marlin"}'
+
+vllm serve RedHatAI/Qwen3-0.6B-FP8-BLOCK \
+    --dtype bfloat16 --kernel-config '{"linear_backend": "marlin"}' \
+    --load-format ipc_cache
+```
+
 The daemon packs the weights and reorders the scales once. Each engine
 reuses those tensors without repacking them, including on repeated restarts.
 The default `zero_copy` mode and disk fallback behavior are unchanged; see
 [Loader configuration](#loader-configuration). Marlin does not support
-`VLLM_BATCH_INVARIANT=1`. This support does not include block FP8, MoE,
-or other compressed-tensors quantization schemes.
+`VLLM_BATCH_INVARIANT=1`. This support does not include other block shapes,
+the W8A16 scheme used on older GPUs, MoE, or other compressed-tensors
+quantization schemes.
 
 ## Limitations
 
@@ -291,11 +306,12 @@ or other compressed-tensors quantization schemes.
   Serialized `compressed-tensors` W8A8 FP8 dense linear layers support
   per-tensor and per-channel weights with static per-tensor or dynamic
   per-token activations when both processes select the CUTLASS linear
-  backend. These checkpoints also support the
+  backend. These checkpoints, and 128×128 block checkpoints with dynamic
+  group-128 activation quantization, also support the
   [Marlin weight-only backend](#compressed-tensors-fp8-with-marlin).
   Engines retain the processed tensor layout and scales and rebuild
   attention scale metadata from the cached scale buffers. Other
-  compressed-tensors schemes, transform wrappers, block FP8 and MoE are
+  compressed-tensors schemes, transform wrappers, other block shapes and MoE are
   not enabled by this support.
   ModelOpt NVFP4 MoE supports the TRT-LLM and vLLM CUTLASS backends. With
   CUTLASS, the daemon fuses activation scales once; engines reuse the fused

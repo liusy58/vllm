@@ -87,8 +87,11 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
     def supports_pre_processed_weights(self) -> bool:  # type: ignore[override]
         kernel = getattr(self, "fp8_linear", None)
         return isinstance(kernel, CutlassFP8ScaledMMLinearKernel) or (
-            self.strategy != QuantizationStrategy.BLOCK
-            and isinstance(kernel, MarlinFP8ScaledMMLinearKernel)
+            isinstance(kernel, MarlinFP8ScaledMMLinearKernel)
+            and (
+                self.strategy != QuantizationStrategy.BLOCK
+                or self.weight_block_size == [128, 128]
+            )
         )
 
     @classmethod
