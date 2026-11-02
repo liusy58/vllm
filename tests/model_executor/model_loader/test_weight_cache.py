@@ -200,6 +200,8 @@ def generate(
     case: ModelCase,
     socket_dir: str | None,
     fallback: bool,
+    *,
+    return_logprobs: bool = False,
 ):
     extra_config = (
         {} if socket_dir is None else {"socket_dir": socket_dir, "fallback": fallback}
@@ -213,7 +215,16 @@ def generate(
         max_num_seqs=1,
         **case.llm_kwargs,
     ) as llm:
-        sampling_params = SamplingParams(temperature=0, max_tokens=16, ignore_eos=True)
+        sampling_params = SamplingParams(
+            temperature=0,
+            max_tokens=16,
+            ignore_eos=True,
+            logprobs=5 if return_logprobs else None,
+        )
+        if return_logprobs:
+            return llm.generate_w_logprobs(
+                case.prompts, sampling_params, images=case.images
+            )
         return llm.generate(case.prompts, sampling_params, images=case.images)
 
 
@@ -359,18 +370,26 @@ def test_d2d_warmup_cache_seeding(vllm_runner, tmp_path, tp_size):
 
     case = replace(
         K3_CASE,
-        llm_kwargs={**K3_CASE.llm_kwargs, "tensor_parallel_size": tp_size},
+        llm_kwargs={
+            **K3_CASE.llm_kwargs,
+            "tensor_parallel_size": tp_size,
+        },
     )
-    os.environ["VLLM_BATCH_INVARIANT"] = "1"
+    # Kimi K3 KDA does not support batch-invariant attention.
+    os.environ["VLLM_BATCH_INVARIANT"] = "0"
     os.environ["VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR"] = str(tmp_path / "baseline")
-    baseline_outputs = generate(vllm_runner, case, None, fallback=True)
-    assert all(text for _, texts in baseline_outputs for text in texts)
+    baseline_outputs = generate(
+        vllm_runner, case, None, fallback=True, return_logprobs=True
+    )
+    assert all(text for _, text, _ in baseline_outputs)
 
     token = "d2d-test-token"
     base_port = get_open_port()
     log_dir = os.environ.get("D2D_E2E_LOG_DIR")
     log_file = (
-        (lambda name: os.path.join(log_dir, name)) if log_dir else lambda name: None
+        (lambda name: os.path.join(log_dir, f"tp{tp_size}-{name}"))
+        if log_dir
+        else lambda name: None
     )
     with WeightCacheDaemon(
         case.model,
@@ -428,10 +447,25 @@ def test_d2d_warmup_cache_seeding(vllm_runner, tmp_path, tp_size):
 
             os.environ["VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR"] = str(tmp_path / "mirror")
             mirror_outputs = generate(
-                vllm_runner, case, mirror.socket_dir, fallback=False
+                vllm_runner,
+                case,
+                mirror.socket_dir,
+                fallback=False,
+                return_logprobs=True,
             )
 
-    assert mirror_outputs == baseline_outputs
+    from tests.models.utils import check_logprobs_close
+
+    assert [(ids, text) for ids, text, _ in mirror_outputs] == [
+        (ids, text) for ids, text, _ in baseline_outputs
+    ]
+    check_logprobs_close(
+        outputs_0_lst=baseline_outputs,
+        outputs_1_lst=mirror_outputs,
+        name_0="default loader",
+        name_1="seeded daemon",
+        always_check_logprobs=True,
+    )
 
 
 def run_cold_start_and_warm_restart(vllm_runner, case: ModelCase, tmp_path, capfd=None):
