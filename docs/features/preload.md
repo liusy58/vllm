@@ -79,10 +79,11 @@ overhead; the amount reclaimed depends on the model and allocator state.
 
 A fresh daemon replica — a new node joining a fleet, a restarted preload
 set — would normally pay the autotune pass itself. With a seed source
-configured, each daemon rank fetches its rank-matched warmup caches from the
+configured, each daemon rank fetches compatible warmup caches from the
 source replica over an authenticated TCP control plane before tuning,
-validates them, and installs them into its own on-disk cache, so its warmup
-skips the profiling sweep. Any failure (unreachable, missing, incompatible)
+validates them, and installs them into its own on-disk cache. Cached operations
+reuse their tuning results; missing operations still tune locally.
+Any failure (unreachable, missing, incompatible)
 falls back to local tuning.
 
 Source replica:
@@ -105,7 +106,7 @@ Each rank binds and dials `base_port + group offset + its global rank`, so one
 `host:base_port` pair covers a whole replica, including the draft daemon group
 when speculative decoding is configured.
 
-The exchange is keyed by the on-disk cache layout: a request names the cache
+Multi-rank daemons exchange v1 per-rank tables: a request names the cache
 by kind, configuration hash, DP rank and world rank, and the source resolves
 it to files under its cache root. Before installing, the target rejects a
 payload whose FlashInfer environment metadata (GPU, CUDA/cuDNN stack) differs
@@ -113,6 +114,22 @@ from its own — such a table would never load anyway, and a hard conflict is
 never overwritten, which would poison the cache file into re-tuning on every
 start. Tables are shareable across vLLM versions as long as the configuration
 hash matches.
+
+Single-rank daemons using FlashInfer's **managed autotune v2 cache** exchange
+preloadable entries from the matching environment instead. Use the same
+`--seed-listen-*`, `--seed-source-*` and `--seed-token` options above with
+`--tensor-parallel-size 1`; seeding is disabled by default without a source.
+`VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR` selects the local cache root on each
+replica. Without that override, the managed store uses FlashInfer's default
+cache root, including `FLASHINFER_AUTOTUNE_CACHE_DIR` when set.
+
+The managed cache requires an exact environment manifest match, including
+the GPU, software versions, cache schema and any measurement policy fields.
+Per-entry measurement provenance is preserved, and existing local winners
+are kept. The daemon still runs warmup; FlashInfer reuses compatible winners
+and profiles misses. Entries that cannot be preloaded, such as older entries
+without structural keys, are not transferred and tune locally when absent.
+This seeds autotune tables; it does not transfer compiled JIT kernels.
 
 The channel is a generic seeding point: warmup caches are the first kind, and
 further daemon state (e.g. Triton warmup caches or weight manifests) plugs in
@@ -242,9 +259,9 @@ Socket paths are derived from the GPU UUID, so they are stable regardless of
   passes, and a table tuned on the draft model would key on the draft's
   config, which no engine looks up), so those deployments' first engine
   tunes and fills the cache instead.
-- **Warmup cache seeding**: only the v1 per-rank FlashInfer autotune cache is
-  seeded; single-rank daemons use FlashInfer's managed v2 store and always
-  tune in place. Seeding requires a trusted network — the TCP channel is
+- **Warmup cache seeding**: supports v1 per-rank FlashInfer tables and
+  compatible preloadable entries from the single-rank managed v2 store.
+  Seeding requires a trusted network — the TCP channel is
   authenticated by a shared token but unencrypted.
 - **Quantization**: every quantization method in the model must declare
   support for pre-processed weights (the daemon transfers weights *after*

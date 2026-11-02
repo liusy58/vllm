@@ -344,7 +344,8 @@ def test_ipc_cache_cold_start_and_warm_restart_tp2_ep(vllm_runner, tmp_path):
 
 @create_new_process_for_each_test()
 @pytest.mark.distributed(num_gpus=2)
-def test_d2d_warmup_cache_seeding(vllm_runner, tmp_path):
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_d2d_warmup_cache_seeding(vllm_runner, tmp_path, tp_size):
     """A mirror daemon adopts the source's autotune cache over D2D, skips
     re-tuning, and serves outputs identical to the default-loader baseline."""
     if not current_platform.is_cuda_alike():
@@ -358,8 +359,10 @@ def test_d2d_warmup_cache_seeding(vllm_runner, tmp_path):
 
     case = replace(
         K3_CASE,
-        llm_kwargs={**K3_CASE.llm_kwargs, "tensor_parallel_size": 2},
+        llm_kwargs={**K3_CASE.llm_kwargs, "tensor_parallel_size": tp_size},
     )
+    os.environ["VLLM_BATCH_INVARIANT"] = "1"
+    os.environ["VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR"] = str(tmp_path / "baseline")
     baseline_outputs = generate(vllm_runner, case, None, fallback=True)
     assert all(text for _, texts in baseline_outputs for text in texts)
 
@@ -369,11 +372,9 @@ def test_d2d_warmup_cache_seeding(vllm_runner, tmp_path):
     log_file = (
         (lambda name: os.path.join(log_dir, name)) if log_dir else lambda name: None
     )
-    # The v1 per-rank cache path needs a multi-rank tuning group (v2 is gated
-    # to single-rank), so both daemons run at tp=2.
     with WeightCacheDaemon(
         case.model,
-        tp_size=2,
+        tp_size=tp_size,
         extra_args=[
             *case.daemon_args,
             "--seed-listen-host",
@@ -392,7 +393,7 @@ def test_d2d_warmup_cache_seeding(vllm_runner, tmp_path):
 
         with WeightCacheDaemon(
             case.model,
-            tp_size=2,
+            tp_size=tp_size,
             extra_args=[
                 *case.daemon_args,
                 "--seed-source-host",
@@ -406,14 +407,26 @@ def test_d2d_warmup_cache_seeding(vllm_runner, tmp_path):
             log_file=log_file("mirror.log"),
         ) as mirror:
             mirror.wait_until_ready()
-            # The mirror adopted both ranks' tables and skipped the sweep.
-            assert mirror.logs.count("Adopted remote flashinfer_autotune seed") == 2
-            assert "Running FlashInfer autotune" not in mirror.logs
-            mirror_tables = sorted(
-                (tmp_path / "mirror").rglob("autotune_configs_dp0_rank*.json")
-            )
-            assert len(mirror_tables) == 2
+            if tp_size == 1:
+                import json
 
+                assert "Adopted remote flashinfer_autotune_v2 seed" in mirror.logs
+                source_tables = {
+                    path.relative_to(tmp_path / "source"): json.loads(path.read_text())
+                    for path in (tmp_path / "source").glob("*/*/entries/*.json")
+                }
+                assert source_tables
+                for path, table in source_tables.items():
+                    assert json.loads((tmp_path / "mirror" / path).read_text()) == table
+            else:
+                assert mirror.logs.count("Adopted remote flashinfer_autotune seed") == 2
+                assert "Running FlashInfer autotune" not in mirror.logs
+                mirror_tables = sorted(
+                    (tmp_path / "mirror").rglob("autotune_configs_dp0_rank*.json")
+                )
+                assert len(mirror_tables) == 2
+
+            os.environ["VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR"] = str(tmp_path / "mirror")
             mirror_outputs = generate(
                 vllm_runner, case, mirror.socket_dir, fallback=False
             )
@@ -1233,6 +1246,98 @@ def test_warmup_cache_metadata_gate():
         kind.validate_payload({filename: [1, 2]})
     with pytest.raises(ValueError, match="exactly one"):
         kind.validate_payload({filename: {}, "extra.json": {}})
+
+
+def test_managed_warmup_cache_seeding(tmp_path, monkeypatch):
+    """D2D preserves managed tactics, key dtypes, policies and local winners."""
+    import torch
+    from flashinfer.autotune_cache import ManagedAutotuneCache
+    from flashinfer.autotuner import ProfilingCacheKey
+
+    from vllm.model_executor.model_loader.weight_cache.seed import (
+        SeedConfig,
+        SeedTransport,
+    )
+    from vllm.model_executor.model_loader.weight_cache.warmup_cache import (
+        FlashInferManagedWarmupCache,
+    )
+
+    manifest = {"gpu": "test-device", "flashinfer_version": "test-version"}
+    source_root = tmp_path / "source"
+    monkeypatch.setenv("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", str(source_root))
+    source = ManagedAutotuneCache(manifest, root=source_root)
+    target = ManagedAutotuneCache(manifest, root=tmp_path / "target")
+    fields = ProfilingCacheKey(
+        "test_op", "test_runner", 0, ((16, 32),), (torch.float16,)
+    ).key_fields
+    local_fields = ProfilingCacheKey(
+        "test_op", "test_runner", 0, ((32, 32),), (torch.float16,)
+    ).key_fields
+    policy = ("events", True, False, 3)
+    for key in (fields, local_fields):
+        source.publish(str(key), "test_runner", [8, [16, 32]], key, policy)
+    target.publish(str(local_fields), "local_runner", 7, local_fields, policy)
+    kind = FlashInferManagedWarmupCache()
+    source_transport = SeedTransport(
+        [kind], SeedConfig(listen=("127.0.0.1", 0), token="test-secret")
+    )
+    address = source_transport.start_listener()
+    assert address is not None
+    try:
+        target_transport = SeedTransport(
+            [kind], SeedConfig(source=address, token="test-secret")
+        )
+        target_transport.adopt(kind, target)
+    finally:
+        source_transport.close()
+
+    # Reopen from disk, so an in-memory publish cannot hide an incomplete write.
+    reopened = ManagedAutotuneCache(manifest, root=target.root)
+    assert reopened.lookup(str(fields)) == source.lookup(str(fields))
+    assert reopened.lookup(str(local_fields)).runner == "local_runner"
+    assert reopened.lookup(str(local_fields)).tactic == 7
+    entries, total, skipped = reopened.preload()
+    assert (len(entries), total, skipped) == (2, 2, 0)
+    assert dict(entries)[fields].profiling_policy == policy
+
+
+def test_managed_warmup_cache_rejects_foreign_or_corrupt_entries(tmp_path, monkeypatch):
+    """Invalid keys and incompatible environments cannot seed another store."""
+    import json
+
+    from flashinfer.autotune_cache import ManagedAutotuneCache
+
+    from vllm.model_executor.model_loader.weight_cache.seed import SeedTransport
+    from vllm.model_executor.model_loader.weight_cache.warmup_cache import (
+        FlashInferManagedWarmupCache,
+    )
+
+    monkeypatch.setenv("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", str(tmp_path))
+    store = ManagedAutotuneCache({"gpu": "source-device"}, root=tmp_path)
+    fields = ("test_op", "test_runner", ((16, 32),), ())
+    store.publish(str(fields), "test_runner", 1, fields)
+    kind = FlashInferManagedWarmupCache()
+    transport = SeedTransport([kind])
+    request = {"kind": kind.kind, **kind.request_params(store)}
+    response = transport.handle_request(request)
+    assert response["status"] == "ok"
+    payload = json.loads(json.dumps(response["payload"]))
+    foreign = ManagedAutotuneCache({"gpu": "target-device"}, root=tmp_path / "target")
+    with pytest.raises(ValueError, match="environment mismatch"):
+        kind.install(foreign, kind.validate_payload(payload))
+    assert not foreign.env_dir.exists()
+    foreign_request = {"kind": kind.kind, **kind.request_params(foreign)}
+    assert transport.handle_request(foreign_request)["status"] == "miss"
+    assert transport.handle_request({**request, "manifest": "../"})["status"] == "error"
+
+    payload["entries"][0]["key_fields"] = {"__dtype__": "not_a_dtype"}
+    with pytest.raises(ValueError, match="key fields"):
+        kind.validate_payload(payload)
+    entry_path = next(store.entries_dir.glob("*.json"))
+    entry = json.loads(entry_path.read_text())
+    entry["key"] = "corrupt-key"
+    entry_path.write_text(json.dumps(entry))
+    assert transport.handle_request(request)["status"] == "miss"
 
 
 def test_remote_warmup_cache_listener(tmp_path, monkeypatch):

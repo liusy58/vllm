@@ -130,6 +130,7 @@ from vllm.model_executor.model_loader.weight_cache.utils import (
     is_draft_model_cacheable,
 )
 from vllm.model_executor.model_loader.weight_cache.warmup_cache import (
+    FlashInferManagedWarmupCache,
     FlashInferWarmupCache,
 )
 from vllm.platforms import current_platform
@@ -223,7 +224,9 @@ class WeightCacheDaemon:
         if parallel_config.enable_eplb:
             raise ValueError("The weight cache daemon does not support EPLB.")
         self.warmup_caches = [FlashInferWarmupCache()]
-        self.d2d = SeedTransport(self.warmup_caches, seed_config)
+        self.d2d = SeedTransport(
+            [*self.warmup_caches, FlashInferManagedWarmupCache()], seed_config
+        )
         self.tp_size = parallel_config.tensor_parallel_size
         self.pp_size = parallel_config.pipeline_parallel_size
         self.dp_size = parallel_config.data_parallel_size
