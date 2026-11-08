@@ -566,23 +566,52 @@ def _case(case: str) -> None:
     def compile_double(kernel):
         n = cute.sym_int()
         x, y = (make_fake_compact_tensor(cutlass.Float32, (n,)) for _ in "xy")
-        stream = make_fake_stream(use_tvm_ffi_env_stream=True)
+        stream = make_fake_stream(use_tvm_ffi_env_stream=case != "launch-attributes")
         compiler = cute.compile
         options = "--enable-tvm-ffi"
         if case == "empty-options":
             compiler = compiler[EnableTVMFFI]
+            options = ""
+        elif case == "launch-attributes":
             options = ""
         return compiler(kernel, x, y, 1, stream, unroll=1, options=options)
 
     def doubles(fn) -> bool:
         x = torch.arange(1000, dtype=torch.float32, device="cuda")
         y = torch.zeros_like(x)
-        fn(x, y, x.numel())
+        if case == "launch-attributes":
+            from cutlass.cute.runtime import from_dlpack
+
+            fn(
+                from_dlpack(x),
+                from_dlpack(y),
+                x.numel(),
+                cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
+            )
+        else:
+            fn(x, y, x.numel())
         torch.accelerator.synchronize()
         return bool(torch.equal(y, x * 2))
 
     kernel = _Double(128)
     compiled = compile_double(kernel)
+    if case == "launch-attributes":
+        from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
+            prepare_shared_carveout,
+            resolve_kernel,
+        )
+
+        torch.empty(1, device="cuda")
+        jit_monitor.activate(mode="error")
+        prepared = prepare_shared_carveout(compiled, 0, 100)
+        _, function = resolve_kernel(compiled, 0)
+        attribute = cuda_driver.CUfunction_attribute
+        status, carveout = cuda_driver.cuFuncGetAttribute(
+            attribute.CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+            function,
+        )
+        assert status == cuda_driver.CUresult.CUDA_SUCCESS and carveout == 100
+        assert doubles(prepared) and doubles(prepared.executor)
     result = {"correct": doubles(compiled), "traced_block": kernel.traced_block}
     if case == "export":
         with tempfile.TemporaryDirectory() as tmp:
@@ -620,7 +649,7 @@ def test_compile_cache_alone_skips_compilation_not_tracing(tmp_path):
 
 
 @_needs_cute_dsl
-@pytest.mark.parametrize("case", ["plain", "empty-options"])
+@pytest.mark.parametrize("case", ["plain", "empty-options", "launch-attributes"])
 def test_a_moved_cache_loads_instead_of_tracing(tmp_path, case):
     first = _run(case, tmp_path / "a")
     assert (

@@ -156,8 +156,11 @@ compiled as usual. A missing, damaged, older-format or unloadable entry is a
 miss, and the recompiled kernel replaces a damaged or unloadable entry unless
 another process already has. A cache directory that is read-only still serves
 hits, and one that cannot be created disables the cache. A kernel loaded from
-the AOT cache is called like the compiled one; code that uses other attributes
-of the result (such as `export_to_c`) gets the kernel compiled as usual on
+the AOT cache is called like the compiled one. For native (non-TVM-FFI) kernels,
+`to(device)` and `library` also use the loaded kernel, allowing CUDA launch
+attributes such as shared-memory carveout to be set without tracing again.
+Other attributes (such as `export_to_c`), and attribute access on TVM-FFI
+results, get the kernel compiled as usual on
 first use, which the JIT monitor treats like a `cute.compile` call.
 
 Each GPU worker logs its counters after warmup (`CuTe DSL caches: ...`): AOT

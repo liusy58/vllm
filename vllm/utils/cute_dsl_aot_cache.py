@@ -27,7 +27,8 @@ binary depend on:
 
 A miss compiles as usual and exports the result as an object file; a hit loads
 it with ``cute.runtime.load_module``. A hit behaves like the compiled function
-when called; using any other attribute (``export_to_c``, ...) compiles the
+when called. Native loaded functions also provide ``to`` and ``library``;
+using other attributes (``export_to_c``, ...) compiles the
 kernel for real first, reported to the JIT monitor like a ``cute.compile``
 call, so callers that export or inspect the result keep working. An entry that
 passes its checksum but fails to load is replaced by the recompiled result,
@@ -858,8 +859,8 @@ def _export(
 class _LoadedKernel:
     """A kernel loaded from the cache.
 
-    Calls go straight to the loaded function. Any other attribute (for
-    example ``export_to_c``) comes from the kernel compiled as usual, on first
+    Calls and native ``to``/``library`` access use the loaded function. Other
+    attributes (for example ``export_to_c``) use the kernel compiled on first
     use, so code written against a compiled function keeps working on a hit.
     That compile does not pass through ``cute.compile``, so it is reported to
     the JIT monitor itself.
@@ -896,6 +897,11 @@ class _LoadedKernel:
             name.startswith("__") and name.endswith("__")
         ):
             raise AttributeError(name)
+        if name in ("to", "library"):
+            from cutlass.base_dsl.jit_executor import JitCompiledFunction
+
+            if isinstance(self._fn, JitCompiledFunction):
+                return getattr(self._fn, name)
         return getattr(self._compile(), name)
 
 
