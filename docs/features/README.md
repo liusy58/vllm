@@ -1,5 +1,9 @@
 # Features
 
+## Startup Caching
+
+- [CuTe DSL compile and AOT caches](preload.md#caching-cute-dsl-kernels)
+
 ## KV Cache Offloading
 
 - [UMBPStoreConnector](umbp_store_connector_usage.md)
