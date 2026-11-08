@@ -615,8 +615,9 @@ def _check_options(compile_options: Any, options: Any) -> None:
     from cutlass.base_dsl.compiler import _parse_compile_options_from_str
 
     parsed = [compile_options]
-    if isinstance(options, str) and options:
-        parsed.append(_parse_compile_options_from_str(options))
+    if isinstance(options, str):
+        if options:
+            parsed.append(_parse_compile_options_from_str(options))
     elif options is not None:
         raise _Uncacheable(f"options of type {type(options).__name__}")
     for opts in parsed:

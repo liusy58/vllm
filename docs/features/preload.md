@@ -146,8 +146,10 @@ installed on each GPU worker before its first compile, avoid that work:
 
 `CUTE_DSL_NO_CACHE`, `CUTE_DSL_KEEP` and `CUTE_DSL_DISABLE_FILE_CACHING` keep
 their meaning for CuTe DSL's caches. The AOT cache also compiles as usual under
-`CUTE_DSL_NO_CACHE`, `CUTE_DSL_KEEP` and with dump, device-function or
-link-library compile options. A compile the AOT cache cannot key exactly (for
+`CUTE_DSL_NO_CACHE`, `CUTE_DSL_KEEP` and with dump (such as `KeepCUBIN`), device-function or
+link-library compile options. Passing `options=""` preserves the options set by
+`cute.compile[...]` and is eligible for AOT caching unless those options require
+uncached compilation. A compile the AOT cache cannot key exactly (for
 example one with a `torch.Tensor` argument or code that cannot be
 fingerprinted), that has no CUDA device, or whose result cannot be exported is
 compiled as usual. A missing, damaged, older-format or unloadable entry is a

@@ -555,6 +555,7 @@ def _run(case: str, cache_root: Path, aot_cache: bool = True) -> dict:
 def _case(case: str) -> None:
     import tempfile
 
+    from cutlass.base_dsl.compiler import EnableTVMFFI
     from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
     from vllm.utils import cute_dsl_compile_cache, jit_monitor
@@ -566,9 +567,12 @@ def _case(case: str) -> None:
         n = cute.sym_int()
         x, y = (make_fake_compact_tensor(cutlass.Float32, (n,)) for _ in "xy")
         stream = make_fake_stream(use_tvm_ffi_env_stream=True)
-        return cute.compile(
-            kernel, x, y, 1, stream, unroll=1, options="--enable-tvm-ffi"
-        )
+        compiler = cute.compile
+        options = "--enable-tvm-ffi"
+        if case == "empty-options":
+            compiler = compiler[EnableTVMFFI]
+            options = ""
+        return compiler(kernel, x, y, 1, stream, unroll=1, options=options)
 
     def doubles(fn) -> bool:
         x = torch.arange(1000, dtype=torch.float32, device="cuda")
@@ -616,14 +620,19 @@ def test_compile_cache_alone_skips_compilation_not_tracing(tmp_path):
 
 
 @_needs_cute_dsl
-def test_a_moved_cache_loads_instead_of_tracing(tmp_path):
-    first = _run("plain", tmp_path / "a")
-    assert first["correct"] and first["misses"] == 1 and first["exports"] == 1
+@pytest.mark.parametrize("case", ["plain", "empty-options"])
+def test_a_moved_cache_loads_instead_of_tracing(tmp_path, case):
+    first = _run(case, tmp_path / "a")
+    assert (
+        first["correct"]
+        and first.get("misses", 0) == 1
+        and first.get("exports", 0) == 1
+    ), first
     assert first["dsl_traces"] >= 1
 
     # A copy at another location, as on another mount or node.
     shutil.copytree(tmp_path / "a", tmp_path / "elsewhere" / "b")
-    second = _run("plain", tmp_path / "elsewhere" / "b")
+    second = _run(case, tmp_path / "elsewhere" / "b")
     assert second["correct"] and second["hits"] == 1
     assert second.get("misses", 0) == 0 and second.get("dsl_traces", 0) == 0
     # State that tracing set on the kernel object is restored on a hit.
