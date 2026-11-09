@@ -2,10 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass, replace
+from typing import Any
 
 import torch
 
 from vllm.config import VllmConfig
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import async_tensor_h2d
@@ -245,6 +250,51 @@ class MambaPrefillCheckpointExporter:
         )
 
 
+def _recurrent_checkpoint_warmup_inputs(
+    *,
+    raw_qkv: TritonWarmupTensor,
+    conv_state: TritonWarmupTensor,
+    recurrent_checkpoint: TritonWarmupTensor,
+    recurrent_state: TritonWarmupTensor,
+    state_len: int,
+) -> dict[str, Any]:
+    """FlashInfer GDN exports FP32 checkpoints using an int64 row map."""
+    row_size = 1
+    for dim in recurrent_checkpoint.shape[1:]:
+        row_size *= dim
+    return dict(
+        grid=(1, 1),
+        x_ptr=raw_qkv,
+        conv_state_ptr=conv_state,
+        recurrent_checkpoint_ptr=recurrent_checkpoint,
+        recurrent_state_ptr=recurrent_state,
+        query_start_loc_ptr=TritonWarmupTensor(torch.int32),
+        checkpoint_offsets_ptr=TritonWarmupTensor(torch.int32),
+        checkpoint_state_indices_ptr=TritonWarmupTensor(torch.int32),
+        recurrent_rows_ptr=TritonWarmupTensor(torch.int64),
+        token_indices_ptr=TritonWarmupTensor(torch.int32),
+        x_stride_0=raw_qkv.stride(0),
+        x_stride_1=raw_qkv.stride(1),
+        state_stride_0=conv_state.stride(0),
+        state_stride_1=conv_state.stride(1),
+        state_stride_2=conv_state.stride(2),
+        checkpoint_stride_0=recurrent_checkpoint.stride(0),
+        recurrent_state_stride_0=recurrent_state.stride(0),
+        checkpoint_offset_stride=1,
+        STATE_LEN=state_len,
+        WIDTH=raw_qkv.shape[-1],
+        RECURRENT_ROW_SIZE=row_size,
+        NULL_STATE_IDX=NULL_BLOCK_ID,
+        HAS_RECURRENT=True,
+        HAS_RECURRENT_ROWS=True,
+        HAS_TOKEN_MAP=False,
+        BLOCK_SIZE=512,
+    )
+
+
+@triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_recurrent_checkpoint_warmup_inputs,
+)
 @triton.jit
 def store_cache_checkpoints_kernel(
     x_ptr,

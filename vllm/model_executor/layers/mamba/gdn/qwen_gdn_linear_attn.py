@@ -42,6 +42,7 @@ from vllm.model_executor.layers.mamba.abstract import (
 )
 from vllm.model_executor.layers.mamba.checkpoint import (
     MambaPrefillCheckpointExporter,
+    store_cache_checkpoints_kernel,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
@@ -73,6 +74,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.warmup.jit_warmup_triton_helper import TritonWarmupTensor
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops import (
     chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
@@ -894,6 +896,44 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        super().bind_kv_cache(kv_cache)
+        if not (
+            self.vllm_config.kernel_config.enable_jit_warmup
+            and self._exports_checkpoints
+        ):
+            return
+        conv_state, recurrent_state = self.kv_cache
+        if not is_conv_state_dim_first():
+            conv_state = conv_state.transpose(-1, -2)
+        conv_metadata = TritonWarmupTensor(
+            conv_state.dtype,
+            shape=tuple(conv_state.shape),
+            strides=conv_state.stride(),
+        )
+        recurrent_metadata = TritonWarmupTensor(
+            recurrent_state.dtype,
+            shape=tuple(recurrent_state.shape),
+            strides=recurrent_state.stride(),
+        )
+        checkpoint_shape, checkpoint_dtype = self._checkpoint_buffer_spec
+        width = self.conv_dim // self.tp_size
+        for row_stride in {width, width + self.value_dim // self.tp_size}:
+            store_cache_checkpoints_kernel.register_warmup(
+                raw_qkv=TritonWarmupTensor(
+                    self.vllm_config.model_config.dtype,
+                    shape=(self._max_num_batched_tokens, width),
+                    strides=(row_stride, 1),
+                ),
+                conv_state=conv_metadata,
+                recurrent_state=recurrent_metadata,
+                recurrent_checkpoint=TritonWarmupTensor(
+                    checkpoint_dtype,
+                    shape=checkpoint_shape,
+                ),
+                state_len=self.conv_kernel_size - 1,
+            )
 
     def get_prefill_checkpoint_alignment(self) -> int | None:
         return self._checkpoint_alignment

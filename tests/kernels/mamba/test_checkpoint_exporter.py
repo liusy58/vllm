@@ -11,17 +11,22 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from vllm.config import VllmConfig
 from vllm.model_executor.layers.mamba.checkpoint import (
     MambaPrefillCheckpointExporter,
     MambaPrefillCheckpointMetadata,
+    store_cache_checkpoints_kernel,
 )
 from vllm.model_executor.layers.mamba.kda_checkpoint import (
     FlashKDAPrefillCheckpointExporter,
 )
+from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+from vllm.model_executor.warmup.jit_warmup_triton_helper import TritonWarmupTensor
 from vllm.models.kimi_k3.amd.ops.kda_checkpoint import (
     KimiK3ROCmKDAPrefillCheckpointExporter,
 )
 from vllm.platforms import current_platform
+from vllm.triton_utils import triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 QUERY_LENS = [1, 160, 96, 200]
@@ -183,13 +188,57 @@ def test_exporter_stores_each_callers_checkpoints(
         kwargs.update(recurrent_rows=rows)
     if c.token_map:
         kwargs.update(token_indices=token_indices)
-    c.exporter.export(
-        checkpoint,
-        raw_qkv=raw_qkv,
-        conv_state=conv_state,
-        cu_seqlens=cu_seqlens,
-        **kwargs,
-    )
+    if caller.startswith("gdn-flashinfer"):
+        registry = JitWarmupRegistry(VllmConfig())
+        conv_before = conv_state.clone()
+        recurrent_before = recurrent_state.clone()
+        with registry.activate():
+            store_cache_checkpoints_kernel.register_warmup(
+                raw_qkv=TritonWarmupTensor(
+                    raw_qkv.dtype,
+                    shape=tuple(raw_qkv.shape),
+                    strides=raw_qkv.stride(),
+                ),
+                conv_state=TritonWarmupTensor(
+                    conv_state.dtype,
+                    shape=tuple(conv_state.shape),
+                    strides=conv_state.stride(),
+                ),
+                recurrent_checkpoint=TritonWarmupTensor(
+                    emitted.dtype,
+                    shape=tuple(emitted.shape),
+                ),
+                recurrent_state=TritonWarmupTensor(
+                    recurrent_state.dtype,
+                    shape=tuple(recurrent_state.shape),
+                    strides=recurrent_state.stride(),
+                ),
+                state_len=c.conv_window,
+            )
+        registry.warmup()
+        assert torch.equal(conv_state, conv_before)
+        assert torch.equal(recurrent_state, recurrent_before)
+
+    previous_hook = triton.knobs.runtime.jit_post_compile_hook
+
+    def observe_compile(**event):
+        assert not caller.startswith("gdn-flashinfer"), (
+            "GDN checkpoint export compiled after registry warmup"
+        )
+        if previous_hook is not None:
+            return previous_hook(**event)
+
+    triton.knobs.runtime.jit_post_compile_hook = observe_compile
+    try:
+        c.exporter.export(
+            checkpoint,
+            raw_qkv=raw_qkv,
+            conv_state=conv_state,
+            cu_seqlens=cu_seqlens,
+            **kwargs,
+        )
+    finally:
+        triton.knobs.runtime.jit_post_compile_hook = previous_hook
 
     assert torch.equal(conv_state, expected_conv)
     assert torch.equal(recurrent_state, expected_recurrent)
